@@ -5,10 +5,16 @@ import (
 	"blog/internal/repository/postgres"
 	handler "blog/internal/transport/http"
 	"blog/internal/usecase"
+	"blog/internal/worker"
 	"context"
 	"database/sql"
+	"errors"
+	"fmt"
+	"go-proj/pkg/events"
 	"go-proj/pkg/gen/auth"
+	"go-proj/pkg/kafka"
 	"log"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
@@ -18,13 +24,18 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	_ "github.com/jackc/pgx/v5/stdlib"
 	"github.com/pressly/goose/v3"
+	"golang.org/x/sync/errgroup"
 	"google.golang.org/grpc"
 )
 
 func main() {
 	cfg := config.MustLoad()
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer cancel()
 
-	dbPool, err := pgxpool.New(context.Background(), cfg.DatabaseURL)
+	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
+
+	dbPool, err := pgxpool.New(ctx, cfg.DatabaseURL)
 	if err != nil {
 		log.Fatalf("failed to connect postgres: %v", err)
 	}
@@ -35,21 +46,17 @@ func main() {
 	}
 
 	func() {
-		// 1. Создаем временное соединение для goose
-		// Нам нужен стандартный sql.DB, goose не умеет в pgxpool напрямую
 		db, err := sql.Open("pgx", cfg.DatabaseURL)
 		if err != nil {
 			log.Fatalf("goose: failed to open db: %v", err)
 		}
 		defer db.Close()
 
-		// 2. Запускаем миграции
 		log.Println("Running migrations...")
 		if err := goose.SetDialect("postgres"); err != nil {
 			log.Fatalf("goose: failed to set dialect: %v", err)
 		}
 
-		// Указываем путь к папке с .sql файлами
 		if err := goose.Up(db, "migrations"); err != nil {
 			log.Fatalf("goose: failed to run migrations: %v", err)
 		}
@@ -60,58 +67,73 @@ func main() {
 	if err != nil {
 		log.Fatalf("Failed to connect to create grpc client: %v", err)
 	}
+	defer conn.Close()
+
 	authClient := auth.NewAuthServiceClient(conn)
 
 	repo := postgres.NewArticleRepository(dbPool)
-	logic := usecase.NewArticleUsecase(repo)
+	outboxRepo := postgres.NewOutboxRepository(dbPool)
+	logic := usecase.NewArticleUsecase(repo, outboxRepo)
 	h := handler.NewHandler(logic, authClient)
 
 	router := h.InitRoutes(conn)
 
-	srv := &http.Server{
-		Addr:         cfg.Address,
+	httpServer := &http.Server{
+		Addr:         cfg.HTTPServer.Address,
 		Handler:      router,
 		ReadTimeout:  cfg.HTTPServer.Timeout,
 		WriteTimeout: cfg.HTTPServer.Timeout,
 		IdleTimeout:  cfg.HTTPServer.IdleTimeout,
 	}
 
-	go func() {
-		log.Printf("Starting server on %s", cfg.HTTPServer.Address)
-		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Fatalf("listen: %s\n", err)
+	if len(cfg.KafkaServer.Brokers) > 0 {
+		logger.Info("kafka config", "brokers", cfg.KafkaServer.Brokers, "topic", events.TopicBlogEvents)
+		if err := kafka.CreateTopics(ctx, cfg.KafkaServer.Brokers[0], []kafka.TopicConfig{
+			{
+				Topic:             events.TopicBlogEvents,
+				NumPartitions:     1,
+				ReplicationFactor: 1,
+			},
+		}); err != nil {
+			logger.Error("failed to create kafka topics", "error", err)
 		}
-	}()
 
-	stop := make(chan os.Signal, 1)
-	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
+		kafkaProducer := kafka.NewProducer(
+			cfg.KafkaServer.Brokers,
+			events.TopicBlogEvents,
+			kafka.WithProducerBatchTimeout(10*time.Millisecond),
+		)
+		defer kafkaProducer.Close()
 
-	<-stop
-
-	log.Println("Shutting down server")
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	if err := srv.Shutdown(ctx); err != nil {
-		log.Fatalf("Server forced to shutdown: %v", err)
+		outboxWorker := worker.NewWorker(outboxRepo, kafkaProducer, logger, 5*time.Second)
+		go outboxWorker.Run(ctx)
+	} else {
+		logger.Warn("KAFKA_SERVER_BROKERS is empty; outbox worker will not publish events")
 	}
 
-	log.Println("Server exiting")
+	g, gCtx := errgroup.WithContext(ctx)
+
+	g.Go(func() error {
+		log.Printf("Starting server on %s", cfg.HTTPServer.Address)
+		if err := httpServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			return fmt.Errorf("http server: %w", err)
+		}
+		return nil
+	})
+
+	g.Go(func() error {
+		<-gCtx.Done()
+		log.Println("Shutting down gracefully...")
+
+		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), cfg.HTTPServer.ShutdownTimeout)
+		defer shutdownCancel()
+
+		return httpServer.Shutdown(shutdownCtx)
+	})
+
+	if err := g.Wait(); err != nil {
+		log.Printf("Service stopped with error: %s", err)
+	} else {
+		log.Println("Service stopped successfully")
+	}
 }
-
-// func main() {
-// 	conn, err := grpc.NewClient(":50051", grpc.WithInsecure())
-// 	if err != nil {
-// 		log.Fatalf("Failed to connect to server: %v", err)
-// 	}
-
-// 	client := auth.NewAuthServiceClient(conn)
-
-// 	response, err := client.ValidateJwt(context.Background(), &auth.ValidateJWTRequest{Jwt: "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJVc2VySUQiOiI4MGUzNjA3Mi1kYzI3LTQ4YTMtOTRhNS00ZmRiOWM0MGFhNTUiLCJFbWFpbCI6InRlc3QyQGV4YW1wbGUuY29tIiwiZXhwIjoxNzc2MTk2OTY3LCJpYXQiOjE3NzYxOTYzNjd9.X9Cdtlasob00SyeBBpdwvCgSf-1_Cyqg3gX5Yqs3pks"})
-// 	if err != nil {
-// 		log.Fatal(err)
-// 	}
-
-// 	log.Printf("result : %v", response)
-// }

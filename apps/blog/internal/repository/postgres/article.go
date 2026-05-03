@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -21,7 +22,28 @@ func NewArticleRepository(db *pgxpool.Pool) domain.ArticleRepository {
 	}
 }
 
+type pgxQuerier interface {
+	QueryRow(ctx context.Context, sql string, arguments ...any) pgx.Row
+	Exec(ctx context.Context, sql string, arguments ...any) (pgconn.CommandTag, error)
+}
+
+func (r *articleRepository) BeginTx(ctx context.Context) (pgx.Tx, error) {
+	tx, err := r.db.Begin(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("article repo: failed to begin transaction: %w", err)
+	}
+	return tx, nil
+}
+
+func (r *articleRepository) CreateWithinTx(ctx context.Context, tx pgx.Tx, article *domain.Article) (*domain.Article, error) {
+	return r.create(ctx, tx, article)
+}
+
 func (r *articleRepository) Create(ctx context.Context, article *domain.Article) (*domain.Article, error) {
+	return r.create(ctx, r.db, article)
+}
+
+func (r *articleRepository) create(ctx context.Context, q pgxQuerier, article *domain.Article) (*domain.Article, error) {
 	query := `
 		INSERT INTO articles (title, author, content, author_id, created_at, updated_at)
 		VALUES ($1, $2, $3, $4, $5, $6)
@@ -30,11 +52,9 @@ func (r *articleRepository) Create(ctx context.Context, article *domain.Article)
 
 	now := time.Now()
 
-	fmt.Println(article.Title, article.Author, article.Content, article.AuthorID, now, now)
-
-	err := r.db.QueryRow(ctx, query, article.Title, article.Author, article.Content, article.AuthorID, now, now).Scan(&article.ID, &article.CreatedAt, &article.UpdatedAt)
+	err := q.QueryRow(ctx, query, article.Title, article.Author, article.Content, article.AuthorID, now, now).Scan(&article.ID, &article.CreatedAt, &article.UpdatedAt)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create article: %w", err)
+		return nil, fmt.Errorf("article repo: failed to create article: %w", err)
 	}
 
 	return article, nil
@@ -44,7 +64,7 @@ func (r *articleRepository) GetAll(ctx context.Context) ([]domain.Article, error
 	query := "SELECT id, title, author, content, author_id, created_at, updated_at FROM articles"
 
 	rows, err := r.db.Query(ctx, query)
-	if err != nil {	
+	if err != nil {
 		return nil, fmt.Errorf("repo: get all articles failed %w", err)
 	}
 

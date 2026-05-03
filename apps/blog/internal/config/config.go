@@ -13,12 +13,18 @@ type Config struct {
 	DatabaseURL     string `yaml:"database_url" env:"DATABASE_URL" env-required:"true"`
 	AuthServiceAddr string `yaml:"auth_service_addr" env:"AUTH_SERVICE_ADDR" env-default:"localhost:50051"`
 	HTTPServer      `yaml:"http_server"`
+	KafkaServer     `yaml:"kafka_server"`
 }
 
 type HTTPServer struct {
-	Address     string        `yaml:"address" env:"HTTP_ADDRESS" env-default:"localhost:8080"`
-	Timeout     time.Duration `yaml:"timeout" env:"HTTP_TIMEOUT" env-default:"4s"`
-	IdleTimeout time.Duration `yaml:"idle_timeout" env:"HTTP_IDLE_TIMEOUT" env-default:"60s"`
+	Address         string        `yaml:"address" env:"HTTP_ADDRESS" env-default:"localhost:8080"`
+	Timeout         time.Duration `yaml:"timeout" env:"HTTP_TIMEOUT" env-default:"4s"`
+	IdleTimeout     time.Duration `yaml:"idle_timeout" env:"HTTP_IDLE_TIMEOUT" env-default:"60s"`
+	ShutdownTimeout time.Duration `yaml:"shutdown_timeout" env:"HTTP_SHUTDOWN_TIMEOUT" env-default:"60s"`
+}
+
+type KafkaServer struct {
+	Brokers []string `yaml:"brokers" env:"KAFKA_SERVER_BROKERS" env-separator:","`
 }
 
 func MustLoad() *Config {
